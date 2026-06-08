@@ -1,0 +1,12 @@
+[package]
+name = "apsu"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+ash = "0.38"
+vk-mem = "0.4"
+anyhow = "1.0"
+glam = "0.32.1"
+bytemuck = "1.25.0"
+egui = "0.34.3"

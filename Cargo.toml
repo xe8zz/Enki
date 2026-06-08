@@ -1,0 +1,18 @@
+[workspace]
+members = [
+    "apsu",
+    "utu",
+    "."
+]
+
+[package]
+name = "enki"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+apsu = { path = "apsu" }
+utu = { path = "utu" }
+
+ash = "0.38"
+anyhow = "1.0"
