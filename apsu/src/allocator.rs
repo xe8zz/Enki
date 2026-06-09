@@ -19,7 +19,21 @@ impl ApsuAllocator {
             instance.get_physical_device_properties(physical_device)
         };
 
-        let is_unified_memory = device_properties.device_type == vk::PhysicalDeviceType::INTEGRATED_GPU;
+        let memory_properties = unsafe {
+            instance.get_physical_device_memory_properties(physical_device)
+        };
+
+        let mut is_unified_memory = device_properties.device_type == vk::PhysicalDeviceType::INTEGRATED_GPU;
+
+        if !is_unified_memory {
+            let has_unified_heap = memory_properties.memory_heaps[..memory_properties.memory_heap_count as usize]
+                .iter()
+                .any(|heap| heap.flags.contains(vk::MemoryHeapFlags::DEVICE_LOCAL) && heap.size > 0);
+
+            if memory_properties.memory_heap_count == 1 && has_unified_heap {
+                is_unified_memory = true;
+            }
+        }
 
         let mut create_info = vk_mem::AllocatorCreateInfo::new(
             instance,
@@ -27,7 +41,8 @@ impl ApsuAllocator {
             physical_device
         );
 
-        create_info.flags = vk_mem::AllocatorCreateFlags::BUFFER_DEVICE_ADDRESS;
+        create_info.flags = vk_mem::AllocatorCreateFlags::BUFFER_DEVICE_ADDRESS
+            | vk_mem::AllocatorCreateFlags::EXT_MEMORY_BUDGET;
 
         let allocator_raw = unsafe {
             Allocator::new(create_info)

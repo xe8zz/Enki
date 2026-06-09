@@ -2,29 +2,41 @@ use ash::vk;
 use anyhow::{Result, Context};
 use std::time::Duration;
 
-use crate::vulkan::VulkanFence;
 use crate::compute::engine::ComputeEngine;
 use crate::compute::pipeline::ComputePipeline;
 
 pub struct ComputeExecutionTask {
-    pub fence: VulkanFence,
-    cmd: vk::CommandBuffer,
-    pool_handle: vk::CommandPool,
+    timeline_semaphore: vk::Semaphore,
+    target_value: u64,
     device: ash::Device,
 }
 
 impl ComputeExecutionTask {
-    pub fn wait(&self, timeout: Duration) -> Result<()> {
-        self.fence.wait(timeout)
+    pub fn is_completed(&self) -> Result<bool> {
+        let current_value = unsafe {
+            self.device.get_semaphore_counter_value(self.timeline_semaphore)
+                .context("[ComputeExecutionTask] Failed to query timeline semaphore counter")?
+        };
+        Ok(current_value >= self.target_value)
     }
-}
 
-impl Drop for ComputeExecutionTask {
-    fn drop(&mut self) {
+    pub fn wait(&self, timeout: Duration) -> Result<()> {
+        let semaphores = [self.timeline_semaphore];
+        let values = [self.target_value];
+
+        let wait_info = vk::SemaphoreWaitInfo::default()
+            .semaphores(&semaphores)
+            .values(&values);
+
         unsafe {
-            let _ = self.fence.wait(Duration::from_secs(3600));
-            self.device.free_command_buffers(self.pool_handle, &[self.cmd]);
+            self.device.wait_semaphores(&wait_info, timeout.as_nanos() as u64)
+                .context("[ComputeExecutionTask] Failed waiting for timeline semaphore")?;
         }
+        Ok(())
+    }
+
+    pub fn target_value(&self) -> u64 {
+        self.target_value
     }
 }
 
@@ -45,7 +57,6 @@ impl<'a> ComputeExecutor<'a> {
         insert_barrier: bool,
     ) -> Result<()> {
         let task = self.dispatch_async(pipeline, grid_size, push_constants, insert_barrier)?;
-
         task.wait(Duration::from_secs(3600))?;
         Ok(())
     }
@@ -59,7 +70,43 @@ impl<'a> ComputeExecutor<'a> {
     ) -> Result<ComputeExecutionTask> {
         let device = &self.engine.device.logical_device;
 
-        let cmd = self.engine.command_pool.allocate_buffer(vk::CommandBufferLevel::PRIMARY)?;
+        self.engine.flush_descriptor_updates()
+            .context("[ComputeExecutor] Failed to flush pending descriptor updates")?;
+
+        let mut command_ring = self.engine.command_ring.lock()
+            .map_err(|_| anyhow::anyhow!("[ComputeExecutor] Failed to lock Command Ring Mutex"))?;
+
+        let slot_idx = command_ring.next_slot_idx % command_ring.slots.len();
+
+        let current_gpu_value = unsafe {
+            device.get_semaphore_counter_value(self.engine.timeline_semaphore.handle)
+                .context("[ComputeExecutor] Failed to query GPU timeline semaphore value")?
+        };
+
+        let slot = &mut command_ring.slots[slot_idx];
+
+        if current_gpu_value < slot.last_submitted_timeline_value {
+            let semaphores = [self.engine.timeline_semaphore.handle];
+            let values = [slot.last_submitted_timeline_value];
+
+            let wait_info = vk::SemaphoreWaitInfo::default()
+                .semaphores(&semaphores)
+                .values(&values);
+
+            unsafe {
+                device.wait_semaphores(&wait_info, u64::MAX)
+                    .context("[ComputeExecutor] Backpressure wait failed")?;
+            }
+        }
+
+        unsafe {
+            device.reset_command_buffer(slot.cmd, vk::CommandBufferResetFlags::empty())
+                .context("[ComputeExecutor] Failed to reset command buffer")?;
+        }
+
+        let cmd = slot.cmd;
+
+        let next_value = self.engine.timeline_counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
 
         let begin_info = vk::CommandBufferBeginInfo::default()
             .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT);
@@ -116,25 +163,32 @@ impl<'a> ComputeExecutor<'a> {
 
         unsafe {
             device.end_command_buffer(cmd)
-                .context("[ComputeExecutor] Failed to finalize compute commands recording")?;
+                .context("[ComputeExecutor] Failed to finalize compute commands")?;
         }
 
-        let fence = VulkanFence::new(device, false)
-            .context("[ComputeExecutor] Failed to create sync fence")?;
+        let signal_semaphores = [self.engine.timeline_semaphore.handle];
+        let signal_values = [next_value];
+
+        let mut timeline_submit_info = vk::TimelineSemaphoreSubmitInfo::default()
+            .signal_semaphore_values(&signal_values);
 
         let command_buffers = [cmd];
         let submit_info = vk::SubmitInfo::default()
-            .command_buffers(&command_buffers);
+            .push_next(&mut timeline_submit_info)
+            .command_buffers(&command_buffers)
+            .signal_semaphores(&signal_semaphores);
 
         unsafe {
-            device.queue_submit(self.engine.queue.handle, &[submit_info], fence.handle)
+            device.queue_submit(self.engine.queue.handle, &[submit_info], vk::Fence::null())
                 .context("[ComputeExecutor] Failed to submit compute commands to queue")?;
         }
 
+        slot.last_submitted_timeline_value = next_value;
+        command_ring.next_slot_idx += 1;
+
         Ok(ComputeExecutionTask {
-            fence,
-            cmd,
-            pool_handle: self.engine.command_pool.handle,
+            timeline_semaphore: self.engine.timeline_semaphore.handle,
+            target_value: next_value,
             device: device.clone(),
         })
     }

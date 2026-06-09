@@ -2,32 +2,37 @@ use ash::vk;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MemoryUsage {
-    DeviceLocal,
-    HostMappable,
-    DynamicAuto,
+    DeviceOnly,
+    Upload,
+    Download,
+    ZeroCopy,
 }
 
 impl MemoryUsage {
     pub fn to_vma(&self, is_unified_memory: bool) -> (vk_mem::MemoryUsage, vk_mem::AllocationCreateFlags) {
         match self {
-            MemoryUsage::DeviceLocal => (
+            MemoryUsage::DeviceOnly => (
                 vk_mem::MemoryUsage::AutoPreferDevice,
                 vk_mem::AllocationCreateFlags::empty(),
             ),
-            MemoryUsage::HostMappable => (
+            MemoryUsage::Upload => (
                 vk_mem::MemoryUsage::AutoPreferHost,
                 vk_mem::AllocationCreateFlags::MAPPED | vk_mem::AllocationCreateFlags::HOST_ACCESS_SEQUENTIAL_WRITE,
             ),
-            MemoryUsage::DynamicAuto => {
+            MemoryUsage::Download => (
+                vk_mem::MemoryUsage::AutoPreferHost,
+                vk_mem::AllocationCreateFlags::MAPPED | vk_mem::AllocationCreateFlags::HOST_ACCESS_RANDOM,
+            ),
+            MemoryUsage::ZeroCopy => {
                 if is_unified_memory {
                     (
-                        vk_mem::MemoryUsage::AutoPreferHost,
-                        vk_mem::AllocationCreateFlags::MAPPED | vk_mem::AllocationCreateFlags::HOST_ACCESS_SEQUENTIAL_WRITE,
+                        vk_mem::MemoryUsage::AutoPreferDevice,
+                        vk_mem::AllocationCreateFlags::MAPPED | vk_mem::AllocationCreateFlags::HOST_ACCESS_RANDOM,
                     )
                 } else {
                     (
-                        vk_mem::MemoryUsage::AutoPreferDevice,
-                        vk_mem::AllocationCreateFlags::empty(),
+                        vk_mem::MemoryUsage::AutoPreferHost,
+                        vk_mem::AllocationCreateFlags::MAPPED | vk_mem::AllocationCreateFlags::HOST_ACCESS_RANDOM,
                     )
                 }
             }

@@ -1,16 +1,67 @@
 use ash::vk;
 use anyhow::{Result, Context};
 use std::sync::Arc;
+use std::sync::Mutex;
+use std::sync::atomic::AtomicU64;
 
 use crate::vulkan::{
     VulkanInstance, VulkanInstanceBuilder,
     PhysicalDeviceInfo, VulkanQueue, VulkanDevice, VulkanDeviceBuilder,
-    VulkanCommandPool,
+    VulkanCommandPool, VulkanSemaphore,
     VulkanDescriptorSetLayout, DescriptorSetLayoutBuilder,
     VulkanDescriptorPool, DescriptorPoolBuilder,
 };
 
-use apsu::{ApsuAllocator, GpuBuffer, BufferUsage, MemoryUsage};
+use apsu::{
+    ApsuAllocator, GpuDeviceBuffer, GpuSharedBuffer, GpuUploadBuffer, GpuReadbackBuffer
+};
+
+pub struct PendingDescriptorWrite {
+    pub slot_index: u32,
+    pub binding: u32,
+    pub descriptor_type: vk::DescriptorType,
+    pub buffer: vk::Buffer,
+    pub range: u64,
+}
+
+pub struct CommandSlot {
+    pub cmd: vk::CommandBuffer,
+    pub last_submitted_timeline_value: u64,
+}
+
+pub struct TimelineCommandRing {
+    pub command_pool: VulkanCommandPool,
+    pub slots: Vec<CommandSlot>,
+    pub next_slot_idx: usize,
+}
+
+impl TimelineCommandRing {
+    pub fn new(device: &ash::Device, queue_family_index: u32, capacity: usize) -> Result<Self> {
+        let command_pool = VulkanCommandPool::new(
+            device,
+            queue_family_index,
+            vk::CommandPoolCreateFlags::RESET_COMMAND_BUFFER,
+        ).context("[TimelineCommandRing] Failed to create command pool")?;
+
+        let raw_buffers = command_pool.allocate_buffers(
+            vk::CommandBufferLevel::PRIMARY,
+            capacity as u32,
+        ).context("[TimelineCommandRing] Failed to allocate initial command buffers")?;
+
+        let slots = raw_buffers.into_iter()
+            .map(|cmd| CommandSlot {
+                cmd,
+                last_submitted_timeline_value: 0,
+            })
+            .collect();
+
+        Ok(Self {
+            command_pool,
+            slots,
+            next_slot_idx: 0,
+        })
+    }
+}
 
 #[derive(Debug, Clone)]
 pub struct ComputeEngineConfig {
@@ -33,7 +84,12 @@ pub struct ComputeEngine {
     pub instance: VulkanInstance,
     pub device: VulkanDevice,
     pub queue: VulkanQueue,
-    pub command_pool: VulkanCommandPool,
+
+    pub command_ring: Mutex<TimelineCommandRing>,
+    pub timeline_semaphore: VulkanSemaphore,
+    pub timeline_counter: AtomicU64,
+
+    pub pending_writes: Mutex<Vec<PendingDescriptorWrite>>,
 
     pub allocator: Arc<ApsuAllocator>,
 
@@ -88,11 +144,16 @@ impl ComputeEngine {
             &device.logical_device,
         ).context("[ComputeEngine] Failed to initialize Apsu Allocator")?);
 
-        let command_pool = VulkanCommandPool::new(
-            &device.logical_device,
-            compute_family_idx,
-            vk::CommandPoolCreateFlags::RESET_COMMAND_BUFFER,
-        ).context("[ComputeEngine] Failed to create Compute Command Pool")?;
+        let command_ring = Mutex::new(
+            TimelineCommandRing::new(&device.logical_device, compute_family_idx, 4)
+                .context("[ComputeEngine] Failed to initialize Timeline Command Ring")?
+        );
+
+        let timeline_semaphore = VulkanSemaphore::new_timeline(&device.logical_device, 0)
+            .context("[ComputeEngine] Failed to create Timeline Semaphore")?;
+
+        let timeline_counter = AtomicU64::new(0);
+        let pending_writes = Mutex::new(Vec::new());
 
         let descriptor_layout = DescriptorSetLayoutBuilder::new()
             .add_binding(
@@ -127,7 +188,10 @@ impl ComputeEngine {
             instance,
             device,
             queue,
-            command_pool,
+            command_ring,
+            timeline_semaphore,
+            timeline_counter,
+            pending_writes,
             allocator,
             descriptor_layout,
             descriptor_pool,
@@ -135,50 +199,118 @@ impl ComputeEngine {
         })
     }
 
-    pub fn create_buffer<T: bytemuck::Pod>(
-        &self,
-        element_count: usize,
-        usage: BufferUsage,
-        memory_usage: MemoryUsage,
-    ) -> Result<GpuBuffer<T>> {
-        GpuBuffer::new(self.allocator.clone(), element_count, usage, memory_usage)
-    }
+    pub fn flush_descriptor_updates(&self) -> Result<()> {
+        let mut writes = self.pending_writes.lock()
+            .map_err(|_| anyhow::anyhow!("[ComputeEngine] Failed to lock pending writes"))?;
 
-    pub fn bind_storage_buffer<T: bytemuck::Pod>(&self, slot_index: u32, buffer: &GpuBuffer<T>) -> Result<()> {
-        let buffer_info = vk::DescriptorBufferInfo::default()
-            .buffer(buffer.buffer)
-            .offset(0)
-            .range(buffer.size_in_bytes);
+        if writes.is_empty() {
+            return Ok(());
+        }
 
-        let write = vk::WriteDescriptorSet::default()
-            .dst_set(self.descriptor_set)
-            .dst_binding(0)
-            .dst_array_element(slot_index)
-            .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
-            .buffer_info(std::slice::from_ref(&buffer_info));
+        let buffer_infos: Vec<vk::DescriptorBufferInfo> = writes
+            .iter()
+            .map(|w| {
+                vk::DescriptorBufferInfo::default()
+                    .buffer(w.buffer)
+                    .offset(0)
+                    .range(w.range)
+            })
+            .collect();
+
+        let write_sets: Vec<vk::WriteDescriptorSet> = writes
+            .iter()
+            .enumerate()
+            .map(|(i, w)| {
+                vk::WriteDescriptorSet::default()
+                    .dst_set(self.descriptor_set)
+                    .dst_binding(w.binding)
+                    .dst_array_element(w.slot_index)
+                    .descriptor_type(w.descriptor_type)
+                    .buffer_info(std::slice::from_ref(&buffer_infos[i]))
+            })
+            .collect();
 
         unsafe {
-            self.device.logical_device.update_descriptor_sets(std::slice::from_ref(&write), &[]);
+            self.device.logical_device.update_descriptor_sets(&write_sets, &[]);
         }
+
+        writes.clear();
         Ok(())
     }
 
-    pub fn bind_uniform_buffer<T: bytemuck::Pod>(&self, slot_index: u32, buffer: &GpuBuffer<T>) -> Result<()> {
-        let buffer_info = vk::DescriptorBufferInfo::default()
-            .buffer(buffer.buffer)
-            .offset(0)
-            .range(buffer.size_in_bytes);
+    pub fn create_device_buffer<T: bytemuck::Pod>(&self, element_count: usize, usage: apsu::BufferUsage) -> Result<GpuDeviceBuffer<T>> {
+        GpuDeviceBuffer::new(self.allocator.clone(), element_count, usage)
+    }
 
-        let write = vk::WriteDescriptorSet::default()
-            .dst_set(self.descriptor_set)
-            .dst_binding(1)
-            .dst_array_element(slot_index)
-            .descriptor_type(vk::DescriptorType::UNIFORM_BUFFER)
-            .buffer_info(std::slice::from_ref(&buffer_info));
+    pub fn create_shared_buffer<T: bytemuck::Pod>(&self, element_count: usize, usage: apsu::BufferUsage) -> Result<GpuSharedBuffer<T>> {
+        GpuSharedBuffer::new(self.allocator.clone(), element_count, usage)
+    }
 
-        unsafe {
-            self.device.logical_device.update_descriptor_sets(std::slice::from_ref(&write), &[]);
-        }
+    pub fn create_upload_buffer<T: bytemuck::Pod>(&self, element_count: usize, usage: apsu::BufferUsage) -> Result<GpuUploadBuffer<T>> {
+        GpuUploadBuffer::new(self.allocator.clone(), element_count, usage)
+    }
+
+    pub fn create_readback_buffer<T: bytemuck::Pod>(&self, element_count: usize, usage: apsu::BufferUsage) -> Result<GpuReadbackBuffer<T>> {
+        GpuReadbackBuffer::new(self.allocator.clone(), element_count, usage)
+    }
+
+    fn bind_storage_buffer_raw(&self, slot_index: u32, buffer: vk::Buffer, size_in_bytes: u64) -> Result<()> {
+        let mut writes = self.pending_writes.lock()
+            .map_err(|_| anyhow::anyhow!("[ComputeEngine] Failed to lock pending writes"))?;
+
+        writes.push(PendingDescriptorWrite {
+            slot_index,
+            binding: 0,
+            descriptor_type: vk::DescriptorType::STORAGE_BUFFER,
+            buffer,
+            range: size_in_bytes,
+        });
         Ok(())
+    }
+
+    fn bind_uniform_buffer_raw(&self, slot_index: u32, buffer: vk::Buffer, size_in_bytes: u64) -> Result<()> {
+        let mut writes = self.pending_writes.lock()
+            .map_err(|_| anyhow::anyhow!("[ComputeEngine] Failed to lock pending writes"))?;
+
+        writes.push(PendingDescriptorWrite {
+            slot_index,
+            binding: 1,
+            descriptor_type: vk::DescriptorType::UNIFORM_BUFFER,
+            buffer,
+            range: size_in_bytes,
+        });
+        Ok(())
+    }
+
+    pub fn bind_storage_device_buffer<T: bytemuck::Pod>(&self, slot_index: u32, buffer: &GpuDeviceBuffer<T>) -> Result<()> {
+        self.bind_storage_buffer_raw(slot_index, buffer.buffer(), buffer.size_in_bytes())
+    }
+
+    pub fn bind_storage_shared_buffer<T: bytemuck::Pod>(&self, slot_index: u32, buffer: &GpuSharedBuffer<T>) -> Result<()> {
+        self.bind_storage_buffer_raw(slot_index, buffer.buffer(), buffer.size_in_bytes())
+    }
+
+    pub fn bind_storage_upload_buffer<T: bytemuck::Pod>(&self, slot_index: u32, buffer: &GpuUploadBuffer<T>) -> Result<()> {
+        self.bind_storage_buffer_raw(slot_index, buffer.buffer(), buffer.size_in_bytes())
+    }
+
+    pub fn bind_storage_readback_buffer<T: bytemuck::Pod>(&self, slot_index: u32, buffer: &GpuReadbackBuffer<T>) -> Result<()> {
+        self.bind_storage_buffer_raw(slot_index, buffer.buffer(), buffer.size_in_bytes())
+    }
+
+    pub fn bind_uniform_device_buffer<T: bytemuck::Pod>(&self, slot_index: u32, buffer: &GpuDeviceBuffer<T>) -> Result<()> {
+        self.bind_uniform_buffer_raw(slot_index, buffer.buffer(), buffer.size_in_bytes())
+    }
+
+    pub fn bind_uniform_shared_buffer<T: bytemuck::Pod>(&self, slot_index: u32, buffer: &GpuSharedBuffer<T>) -> Result<()> {
+        self.bind_uniform_buffer_raw(slot_index, buffer.buffer(), buffer.size_in_bytes())
+    }
+
+    pub fn bind_uniform_upload_buffer<T: bytemuck::Pod>(&self, slot_index: u32, buffer: &GpuUploadBuffer<T>) -> Result<()> {
+        self.bind_uniform_buffer_raw(slot_index, buffer.buffer(), buffer.size_in_bytes())
+    }
+
+    pub fn bind_uniform_readback_buffer<T: bytemuck::Pod>(&self, slot_index: u32, buffer: &GpuReadbackBuffer<T>) -> Result<()> {
+        self.bind_uniform_buffer_raw(slot_index, buffer.buffer(), buffer.size_in_bytes())
     }
 }
