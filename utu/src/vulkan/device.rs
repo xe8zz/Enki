@@ -118,11 +118,13 @@ impl<'a> VulkanDeviceBuilder<'a> {
             .descriptor_binding_storage_buffer_update_after_bind(self.enable_descriptor_indexing)
             .descriptor_binding_sampled_image_update_after_bind(self.enable_descriptor_indexing)
             .descriptor_binding_storage_image_update_after_bind(self.enable_descriptor_indexing)
-            .descriptor_binding_uniform_buffer_update_after_bind(self.enable_descriptor_indexing);
+            .descriptor_binding_uniform_buffer_update_after_bind(self.enable_descriptor_indexing)
+            .timeline_semaphore(true);
 
         let mut features13 = vk::PhysicalDeviceVulkan13Features::default()
             .dynamic_rendering(true)
             .synchronization2(true);
+
 
         let mut features2 = vk::PhysicalDeviceFeatures2::default()
             .push_next(&mut features11)

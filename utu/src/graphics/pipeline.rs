@@ -19,6 +19,8 @@ impl GpuGraphicsPipeline {
         color_format: vk::Format,
         topology: vk::PrimitiveTopology,
         push_constants_size: u32,
+        vertex_bindings: &[vk::VertexInputBindingDescription],
+        vertex_attributes: &[vk::VertexInputAttributeDescription],
     ) -> Result<Self> {
         let vertex_module = VulkanShaderModule::from_bytes(device, vertex_shader_spv)
             .context("[GpuGraphicsPipeline] Failed to compile vertex shader module")?;
@@ -58,7 +60,9 @@ impl GpuGraphicsPipeline {
                 .context("[GpuGraphicsPipeline] Failed to create pipeline layout")?
         };
 
-        let vertex_input = vk::PipelineVertexInputStateCreateInfo::default();
+        let vertex_input = vk::PipelineVertexInputStateCreateInfo::default()
+            .vertex_binding_descriptions(vertex_bindings)
+            .vertex_attribute_descriptions(vertex_attributes);
 
         let input_assembly = vk::PipelineInputAssemblyStateCreateInfo::default()
             .topology(topology)

@@ -2,8 +2,7 @@
 members = [
     "apsu",
     "utu",
-    "."
-]
+    "enki_macros"]
 
 [package]
 name = "enki"
@@ -13,6 +12,9 @@ edition = "2024"
 [dependencies]
 apsu = { path = "apsu" }
 utu = { path = "utu" }
+enki_macros = { path = "enki_macros" }
 
 ash = "0.38"
 anyhow = "1.0"
+bytemuck = "1.25.0"
+winit = "0.29.15"

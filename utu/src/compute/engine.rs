@@ -3,6 +3,7 @@ use anyhow::{Result, Context};
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::atomic::AtomicU64;
+use std::ffi::CStr;
 
 use crate::vulkan::{
     VulkanInstance, VulkanInstanceBuilder,
@@ -68,6 +69,10 @@ pub struct ComputeEngineConfig {
     pub app_name: String,
     pub max_storage_buffers: u32,
     pub max_uniform_buffers: u32,
+
+    pub required_instance_extensions: Vec<std::ffi::CString>,
+    pub required_device_extensions: Vec<std::ffi::CString>,
+    pub request_graphics_queue: bool,
 }
 
 impl Default for ComputeEngineConfig {
@@ -76,6 +81,9 @@ impl Default for ComputeEngineConfig {
             app_name: "Enki Compute Engine".to_string(),
             max_storage_buffers: 1024,
             max_uniform_buffers: 256,
+            required_instance_extensions: Vec::new(),
+            required_device_extensions: Vec::new(),
+            request_graphics_queue: false,
         }
     }
 }
@@ -100,7 +108,13 @@ pub struct ComputeEngine {
 
 impl ComputeEngine {
     pub fn new(config: ComputeEngineConfig) -> Result<Self> {
+        let required_instance_extensions: Vec<&CStr> = config.required_instance_extensions
+            .iter()
+            .map(|c| c.as_c_str())
+            .collect();
+
         let instance = VulkanInstanceBuilder::new(config.app_name.as_str())
+            .with_extensions(&required_instance_extensions)
             .build()
             .context("[ComputeEngine] Failed to build Vulkan Instance")?;
 
@@ -125,14 +139,29 @@ impl ComputeEngine {
             })
             .ok_or_else(|| anyhow::anyhow!("[ComputeEngine] No physical device with GPGPU/Compute support found"))?;
 
-        let compute_family_idx = selected_gpu_info.queue_families.iter()
-            .position(|q| q.queue_flags.contains(vk::QueueFlags::COMPUTE))
-            .unwrap() as u32;
+        let queue_family_idx = if config.request_graphics_queue {
+            selected_gpu_info.queue_families.iter()
+                .position(|q| q.queue_flags.contains(vk::QueueFlags::COMPUTE | vk::QueueFlags::GRAPHICS))
+                .or_else(|| {
+                    selected_gpu_info.queue_families.iter().position(|q| q.queue_flags.contains(vk::QueueFlags::COMPUTE))
+                })
+                .ok_or_else(|| anyhow::anyhow!("[ComputeEngine] No queue family with Compute + Graphics support found"))? as u32
+        } else {
+            selected_gpu_info.queue_families.iter()
+                .position(|q| q.queue_flags.contains(vk::QueueFlags::COMPUTE))
+                .ok_or_else(|| anyhow::anyhow!("[ComputeEngine] No queue family with Compute support found"))? as u32
+        };
+
+        let required_device_extensions: Vec<&CStr> = config.required_device_extensions
+            .iter()
+            .map(|c| c.as_c_str())
+            .collect();
 
         let (device, mut queues) = VulkanDeviceBuilder::new(selected_gpu_info.handle)
-            .request_queue(compute_family_idx, vec![1.0])
+            .request_queue(queue_family_idx, vec![1.0])
             .enable_buffer_device_address(true)
             .enable_descriptor_indexing(true)
+            .with_extensions(&required_device_extensions)
             .build(&instance.instance)
             .context("[ComputeEngine] Failed to build Vulkan Logical Device")?;
 
@@ -145,7 +174,7 @@ impl ComputeEngine {
         ).context("[ComputeEngine] Failed to initialize Apsu Allocator")?);
 
         let command_ring = Mutex::new(
-            TimelineCommandRing::new(&device.logical_device, compute_family_idx, 4)
+            TimelineCommandRing::new(&device.logical_device, queue_family_idx, 4)
                 .context("[ComputeEngine] Failed to initialize Timeline Command Ring")?
         );
 
@@ -160,14 +189,14 @@ impl ComputeEngine {
                 0,
                 vk::DescriptorType::STORAGE_BUFFER,
                 config.max_storage_buffers,
-                vk::ShaderStageFlags::COMPUTE,
+                vk::ShaderStageFlags::COMPUTE | vk::ShaderStageFlags::VERTEX | vk::ShaderStageFlags::FRAGMENT,
                 vk::DescriptorBindingFlags::PARTIALLY_BOUND | vk::DescriptorBindingFlags::UPDATE_AFTER_BIND,
             )
             .add_binding(
                 1,
                 vk::DescriptorType::UNIFORM_BUFFER,
                 config.max_uniform_buffers,
-                vk::ShaderStageFlags::COMPUTE,
+                vk::ShaderStageFlags::COMPUTE | vk::ShaderStageFlags::VERTEX | vk::ShaderStageFlags::FRAGMENT,
                 vk::DescriptorBindingFlags::PARTIALLY_BOUND | vk::DescriptorBindingFlags::UPDATE_AFTER_BIND,
             )
             .build(&device.logical_device)

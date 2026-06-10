@@ -40,27 +40,4 @@ impl MemoryUsage {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum BufferUsage {
-    Storage,
-    Uniform,
-    TransferSrc,
-    TransferDst,
-    Indirect,
-    Vertex,
-    Index,
-}
-
-impl BufferUsage {
-    pub fn to_vk(&self) -> vk::BufferUsageFlags {
-        match self {
-            BufferUsage::Storage => vk::BufferUsageFlags::STORAGE_BUFFER,
-            BufferUsage::Uniform => vk::BufferUsageFlags::UNIFORM_BUFFER,
-            BufferUsage::TransferSrc => vk::BufferUsageFlags::TRANSFER_SRC,
-            BufferUsage::TransferDst => vk::BufferUsageFlags::TRANSFER_DST,
-            BufferUsage::Indirect => vk::BufferUsageFlags::INDIRECT_BUFFER,
-            BufferUsage::Vertex => vk::BufferUsageFlags::VERTEX_BUFFER,
-            BufferUsage::Index => vk::BufferUsageFlags::INDEX_BUFFER,
-        }
-    }
-}
+pub type BufferUsage = ash::vk::BufferUsageFlags;

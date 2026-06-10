@@ -6,6 +6,7 @@ use std::sync::Arc;
 pub struct ApsuAllocator {
     pub allocator: Arc<Allocator>,
     pub device: ash::Device,
+    pub physical_device: vk::PhysicalDevice,
     pub is_unified_memory: bool,
 }
 
@@ -18,6 +19,7 @@ impl ApsuAllocator {
         let device_properties = unsafe {
             instance.get_physical_device_properties(physical_device)
         };
+
 
         let memory_properties = unsafe {
             instance.get_physical_device_memory_properties(physical_device)
@@ -52,6 +54,7 @@ impl ApsuAllocator {
         Ok(Self {
             allocator: Arc::new(allocator_raw),
             device: device.clone(),
+            physical_device,
             is_unified_memory,
         })
     }

@@ -23,7 +23,7 @@ impl RawGpuBuffer {
         usage: BufferUsage,
         memory_usage: MemoryUsage,
     ) -> Result<Self> {
-        let vk_usage = usage.to_vk()
+        let vk_usage = usage
             | vk::BufferUsageFlags::SHADER_DEVICE_ADDRESS
             | vk::BufferUsageFlags::TRANSFER_SRC
             | vk::BufferUsageFlags::TRANSFER_DST;

@@ -26,7 +26,7 @@ impl GpuTransferManager {
         let staging_buffer = GpuUploadBuffer::new(
             allocator_ctx.clone(),
             staging_size_in_bytes,
-            crate::types::BufferUsage::TransferSrc,
+            crate::types::BufferUsage::TRANSFER_SRC,
         ).context("[GpuTransferManager] Failed to allocate persistent staging buffer")?;
 
         Ok(Self {
@@ -71,7 +71,7 @@ impl GpuTransferManager {
             let temp_staging = GpuUploadBuffer::<T>::new(
                 self.allocator_ctx.clone(),
                 data.len(),
-                crate::types::BufferUsage::TransferSrc,
+                crate::types::BufferUsage::TRANSFER_SRC,
             ).context("[GpuTransferManager] Failed to allocate temporary staging buffer")?;
 
             temp_staging.write(data)?;
